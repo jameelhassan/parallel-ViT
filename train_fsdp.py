@@ -6,14 +6,14 @@ from tqdm import tqdm
 import numpy as np
 import argparse
 import wandb
-
+import functools
 import torch.nn as nn
 import torch.optim as optim
 import torch.utils.data as data
 from torch.utils.data import DataLoader
 import torch.distributed as dist
 from torchvision import datasets, transforms
-
+import torch.nn.functional as F
 from tiny_imagenet import TinyImageNetDataset
 
 # Distributed imports
@@ -48,48 +48,6 @@ def cleanup():
     dist.destroy_process_group()
 
 # Training loop
-def train(train_loader, model, epoch_number, learning_rate, device):
-    # Train the model
-    num_epochs = epoch_number
-    # Set the loss function and optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    for epoch in range(num_epochs):
-        start_time = time()
-        model.train()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-        for i, (images, labels) in tqdm(enumerate(train_loader), total=len(train_loader)):
-            images, labels = images.to(device), labels.to(device)
-
-            optimizer.zero_grad()
-
-            outputs = model(images)
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-
-            _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum()
-
-            running_loss += loss.item()
-
-        train_accuracy = 100 * correct / total
-        epoch_time = time() - start_time
-
-        # Validate every 3 epochs
-        if (epoch + 1) % 3 == 0:
-            torch.cuda.empty_cache()
-            val_acc, val_loss = validate(val_loader, model, device)
-            wandb.log({"epoch": epoch, "loss": running_loss / len(train_loader), "train_acc": train_accuracy, "val_acc": val_acc, "val_loss": val_loss})
-            print(f"Epoch [{epoch}/{num_epochs-1}] {epoch_time:.2f}secs, Loss: {running_loss / len(train_loader):.4f}, Train Acc: {train_accuracy:.4f}, Val Acc: {val_acc:.4f}, Val Loss: {val_loss:.4f}")
-        else:
-            wandb.log({"epoch": epoch, "epoch_time": epoch_time, "loss": running_loss / len(train_loader), "train_acc": train_accuracy})
-            print(f"Epoch [{epoch}/{num_epochs-1}] {epoch_time:.2f}secs, Loss: {running_loss / len(train_loader):.4f}")
-        
-    return model
 
 def validate(val_loader, model,rank, device):
     # Test the model
@@ -133,8 +91,131 @@ def get_datasets():
     
     return train_dataset, val_dataset
 
+def train(args, model, rank, world_size, train_loader, optimizer, epoch, sampler=None):
+    model.train()
+    ddp_loss = torch.zeros(2).to(rank)
+    criterion = nn.CrossEntropyLoss()
+    if sampler:
+        sampler.set_epoch(epoch)
+    for batch_idx, (data, target) in enumerate(train_loader):
+        data, target = data.to(rank), target.to(rank)
+        optimizer.zero_grad()
+        output = model(data)
+        loss = criterion (output, target)
+        loss.backward()
+        optimizer.step()
+        ddp_loss[0] += loss.item()
+        ddp_loss[1] += len(data)
 
-def ddp_train(rank, world_size, args):
+    dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
+    if rank == 0:
+        print('Train Epoch: {} \tLoss: {:.6f}'.format(epoch, ddp_loss[0] / ddp_loss[1]))
+        wandb.log({"epoch": epoch, "loss": ddp_loss[0] / ddp_loss[1]})
+def test(model, rank, world_size, test_loader,epoch):
+    model.eval()
+    correct = 0
+    ddp_loss = torch.zeros(3).to(rank)
+    criterion = nn.CrossEntropyLoss()
+    with torch.no_grad():
+        for data, target in test_loader:
+            data, target = data.to(rank), target.to(rank)
+            output = model(data)
+            ddp_loss[0] += criterion(output, target).item()  # sum up batch loss
+            pred = output.argmax(dim=1, keepdim=True)  # get the index of the max log-probability
+            ddp_loss[1] += pred.eq(target.view_as(pred)).sum().item()
+            ddp_loss[2] += len(data)
+
+    dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
+
+    if rank == 0:
+        test_loss = ddp_loss[0] / ddp_loss[2]
+        print('Test set: Average loss: {:.4f}, Accuracy: {}/{} ({:.2f}%)\n'.format(
+            test_loss, int(ddp_loss[1]), int(ddp_loss[2]),
+            100. * ddp_loss[1] / ddp_loss[2]))
+        wandb.log({"epoch": epoch,"test_loss": test_loss, "test_acc": 100. * ddp_loss[1] / ddp_loss[2]})
+def fsdp_main(rank, world_size, args):
+    setup(rank, world_size)
+
+    transform=transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
+    ])
+    if rank == 0:
+        wandb.init(project="VIT_FSDP", name="2_gpu", config=args)
+    # dataset1 = datasets.MNIST('../data', train=True, download=True,
+    #                     transform=transform)
+    # dataset2 = datasets.MNIST('../data', train=False,
+    #                     transform=transform)
+
+    dataset1, dataset2 = get_datasets()
+    sampler1 = DistributedSampler(dataset1, rank=rank, num_replicas=world_size, shuffle=True)
+    sampler2 = DistributedSampler(dataset2, rank=rank, num_replicas=world_size)
+
+    
+    # train_loader = DataLoader(train_ds, batch_size=int(args.batch_size / args.world_size), shuffle=False, 
+    #                           num_workers=4, sampler=DistributedSampler(train_ds))
+    # val_loader = DataLoader(val_ds, batch_size=args.batch_size//2, shuffle=False, num_workers=4)
+
+    
+
+    train_kwargs = {'batch_size': args.batch_size, 'sampler': sampler1}
+    test_kwargs = {'batch_size': args.test_batch_size, 'sampler': sampler2}
+    cuda_kwargs = {'num_workers': 2,
+                    'pin_memory': True,
+                    'shuffle': False}
+    train_kwargs.update(cuda_kwargs)
+    test_kwargs.update(cuda_kwargs)
+
+    train_loader = torch.utils.data.DataLoader(dataset1,**train_kwargs)
+    test_loader = torch.utils.data.DataLoader(dataset2, **test_kwargs)
+    my_auto_wrap_policy = functools.partial(
+        size_based_auto_wrap_policy, min_num_params=100
+    )
+    torch.cuda.set_device(rank)
+
+
+    init_start_event = torch.cuda.Event(enable_timing=True)
+    init_end_event = torch.cuda.Event(enable_timing=True)
+
+    model = ViT(
+        image_size = 224,
+        patch_size = args.patch_size,
+        num_classes = 200,
+        dim = args.emb_dim,
+        depth = 12,
+        heads = 16,
+        mlp_dim = 2048,
+        dropout = 0.1,
+        emb_dropout = 0.1
+    ).to(rank)
+
+    model = FSDP(model)
+    
+    optimizer = optim.Adam(model.parameters(), lr=args.lr)
+
+    # scheduler = StepLR(optimizer, step_size=1, gamma=args.gamma)
+    init_start_event.record()
+    for epoch in range(1, args.epochs + 1):
+        train(args, model ,rank, world_size, train_loader, optimizer, epoch, sampler=sampler1)
+        test(model, rank, world_size, test_loader, epoch)
+        optimizer.step()
+
+    init_end_event.record()
+
+    if rank == 0:
+        print(f"CUDA event elapsed time: {init_start_event.elapsed_time(init_end_event) / 1000}sec")
+        print(f"{model}")
+
+    if args.save_model:
+        # use a barrier to make sure training is done on all ranks
+        dist.barrier()
+        states = model.state_dict()
+        if rank == 0:
+            torch.save(states, "mnist_cnn.pt")
+
+    cleanup()
+
+def fsdp_train(rank, world_size, args):
     setup(rank, world_size)
 
     # WandB stuff
@@ -155,7 +236,7 @@ def ddp_train(rank, world_size, args):
         patch_size = args.patch_size,
         num_classes = 200,
         dim = args.emb_dim,
-        depth = 12,
+        depth = 6,
         heads = 16,
         mlp_dim = 2048,
         dropout = 0.1,
@@ -168,7 +249,7 @@ def ddp_train(rank, world_size, args):
     val_loader = DataLoader(val_ds, batch_size=args.batch_size//2, shuffle=False, num_workers=4)
 
     model = model.to(rank)
-    model = DDP(model, device_ids=[rank])
+    model = FSDP(model)
 
     num_epochs = args.epochs
 
@@ -187,6 +268,7 @@ def ddp_train(rank, world_size, args):
         running_loss = 0.0
         correct = 0
         total = 0
+        ddp_loss = torch.zeros(2).to(rank)
         for i, (images, labels) in enumerate(train_loader):
             images, labels = images.to(rank), labels.to(rank)
             optimizer.zero_grad()
@@ -195,7 +277,8 @@ def ddp_train(rank, world_size, args):
             loss = criterion(outputs, labels)
             loss.backward()
             optimizer.step()
-
+            ddp_loss[0]+=loss.item()
+            ddp_loss[1]+=len(labels)
             _, predicted = torch.max(outputs.data, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum()
@@ -206,20 +289,24 @@ def ddp_train(rank, world_size, args):
 
         train_accuracy = 100 * correct / total
         epoch_time = time() - start_time
-
+        dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
         if rank == 0:
+            
             if (epoch + 1) % 1 == 0:
                 torch.cuda.empty_cache()
-                val_acc, val_loss = validate(val_loader, model, f'cuda:{str(rank)}')
+                val_acc, val_loss,ddp_loss = validate(val_loader, model,rank, f'cuda:{str(rank)}')
                 wandb.log({"epoch": epoch, "loss": running_loss / len(train_loader), "train_acc": train_accuracy, "val_acc": val_acc, "val_loss": val_loss})
                 print(f"Epoch [{epoch}/{num_epochs-1}] {epoch_time}s, Loss: {running_loss / len(train_loader):.4f}, Train Acc: {train_accuracy:.4f}, Val Acc: {val_acc:.4f}, Val Loss: {val_loss:.4f}")
+                test_loss = ddp_loss[0] / ddp_loss[2]
+                print('Test set: Average loss: {:.4f}, Accuracy: {}/{} ({:.2f}%)\n'.format(
+                    test_loss, int(ddp_loss[1]), int(ddp_loss[2]),
+                    100. * ddp_loss[1] / ddp_loss[2]))
             else:
+                test_loss = ddp_loss[0] / ddp_loss[1]
                 wandb.log({"epoch": epoch, "epoch_time": epoch_time, "loss": running_loss / len(train_loader), "train_acc": train_accuracy})
                 print(f"Epoch [{epoch}/{num_epochs-1}] {epoch_time}s, Loss: {running_loss / len(train_loader):.4f}, Train Acc: {train_accuracy:.4f}\n")
-
+                print('Train Epoch: {} \tLoss: {:.6f}'.format(epoch, ddp_loss[0] / ddp_loss[1]))
     cleanup()
-
-
 
 if __name__ == "__main__":
     #parse command line arguments
@@ -227,63 +314,19 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=50, help="number of epochs")
     parser.add_argument("--lr", type=float, default=0.0002, help="learning rate")
     parser.add_argument("--batch_size", type=int, default=256, help="batch size")
+    parser.add_argument("--test_batch_size", type=int, default=256, help="test batch size")
     parser.add_argument("--num_workers", type=int, default=4, help="number of workers")
     parser.add_argument("--patch_size", type=int, default=16, help="patch size")
     parser.add_argument("--emb_dim", type=int, default=768, help="embedding dimension")
     parser.add_argument("--setting", type=str, default="fsdp", help="Training setting")
     parser.add_argument("--world_size", type=int, default=2, help="Number of GPUs to use")
+    parser.add_argument("--save_model", action="store_true", help="Save model weights")
+    
     args = parser.parse_args()
     
-    if args.setting == "baseline":
-        variant = 'B' if args.emb_dim == 768 else 'L'
-        exp_name = f"ViT_{args.setting}_ep{args.epochs}_LR{args.lr}_BS{args.batch_size}_{args.patch_size}P_{variant}/emb{args.emb_dim}"
-        wandb_config = dict(
-            epochs=args.epochs,
-            learning_rate=args.lr,
-            batch_size=args.batch_size,
-            )
-        
-        # Get dataset
-        train_transforms = transforms.Compose([
-            transforms.Resize(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-        ])
-        val_transforms = transforms.Compose([
-            transforms.Resize(224),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-        ])
-        train_dataset = TinyImageNetDataset(root_dir='data/tiny-imagenet-200', transform=train_transforms)
-        val_dataset = TinyImageNetDataset(root_dir='data/tiny-imagenet-200', mode='val', transform=val_transforms)
+    wandb.init(project="VIT_FSDP", name="2_gpu", config=args)
 
-        train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=4)
-        val_loader = DataLoader(val_dataset, batch_size=args.batch_size//2, shuffle=False, num_workers=4)
-
-        model = ViT(
-            image_size = 224,
-            patch_size = args.patch_size,
-            num_classes = 200,
-            dim = args.emb_dim,
-            depth = 6,
-            heads = 16,
-            mlp_dim = 2048,
-            dropout = 0.1,
-            emb_dropout = 0.1
-        )
-
-        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
-        model.to(device)
-
-        # Sanity check
-        print("Running sanity validation check")
-        acc = validate(val_loader, model, device)
-
-        #Train the model
-        with wandb.init(project="ML710", name=exp_name, config=wandb_config):
-            model = train(train_loader, model, epoch_number=args.epochs, learning_rate=args.lr, device=device)
-
-    elif args.setting == "ddp":
-        mp.spawn(ddp_train, args=(args.world_size, args), nprocs=args.world_size, join=True)
-    
+    # if args.setting == "ddp":
+    #     mp.spawn(ddp_train, args=(args.world_size, args), nprocs=args.world_size, join=True)
+    if args.setting == "fsdp":
+        mp.spawn(fsdp_main, args=(args.world_size, args), nprocs=args.world_size, join=True)
