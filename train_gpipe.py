@@ -28,6 +28,10 @@ import tempfile
 from torch.distributed.pipeline.sync import Pipe
 from pipe_vit import PipeViT
 
+## GPipe imports
+from pipe_vit import GPipeViT
+from torchgpipe import GPipe
+
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12359'
@@ -52,7 +56,7 @@ def train(train_loader, model, epoch_number, learning_rate, device):
         correct = 0
         total = 0
         for i, (images, labels) in tqdm(enumerate(train_loader), total=len(train_loader)):
-            images, labels = images.to(device), labels.to(device)
+            images, labels = images.to("cuda:0"), labels.to("cuda:3")
 
             optimizer.zero_grad()
 
@@ -205,200 +209,18 @@ def ddp_train(rank, world_size, args):
 
     cleanup()
 
-def model_pipe_rank(args):
-    model_layers = PipeViT(
-            image_size = 224,
-            patch_size = args.patch_size,
-            num_classes = 200,
-            dim = args.emb_dim,
-            depth = 6,
-            heads = 16,
-            mlp_dim = 2048,
-            dropout = 0.1,
-            emb_dropout = 0.1
-        )
-
-    model_layers = [nn.Sequential(*layer).to(f"cuda:{str(rank)}") for (rank, layer) in enumerate(model_layers)]
-    return model_layers
-
-# Pipeline Training
-def train_pipe(train_loader, model, epoch_number, learning_rate):
-    # Train the model
-    num_epochs = epoch_number
-    # Set the loss function and optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate)
-    for epoch in range(num_epochs):
-        start_time = time()
-        model.train()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-        for i, (images, labels) in tqdm(enumerate(train_loader), total=len(train_loader)):
-            images, labels = images.to("cuda:0"), labels.to("cuda:1")
-            optimizer.zero_grad()
-
-            outputs = model(images).local_value()
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-
-            _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum()
-
-            running_loss += loss.item()
-
-        train_accuracy = 100 * correct / total
-        epoch_time = time() - start_time
-
-        # # Validate every 3 epochs
-        # if (epoch + 1) % 3 == 0:
-        #     torch.cuda.empty_cache()
-        #     val_acc, val_loss = validate(val_loader, model, device)
-        #     # wandb.log({"epoch": epoch, "loss": running_loss / len(train_loader), "train_acc": train_accuracy, "val_acc": val_acc, "val_loss": val_loss})
-        #     print(f"Epoch [{epoch}/{num_epochs-1}] {epoch_time:.2f}secs, Loss: {running_loss / len(train_loader):.4f}, Train Acc: {train_accuracy:.4f}, Val Acc: {val_acc:.4f}, Val Loss: {val_loss:.4f}")
-        # else:
-        wandb.log({"epoch": epoch, "epoch_time": epoch_time, "loss": running_loss / len(train_loader), "train_acc": train_accuracy})
-        print(f"Epoch [{epoch}/{num_epochs-1}] {epoch_time:.2f}secs, Loss: {running_loss / len(train_loader):.4f}")
-
-
-def model_ddp_pipe_rank(args, rank):
-    model_layers = PipeViT(
-            image_size = 224,
-            patch_size = args.patch_size,
-            num_classes = 200,
-            dim = args.emb_dim,
-            depth = args.depth,
-            heads = 16,
-            mlp_dim = 2048,
-            dropout = 0.1,
-            emb_dropout = 0.1
-        )
-
-    model_layers = [nn.Sequential(*layer).to(f"cuda:{str(idx + 2 * rank)}") for (idx, layer) in enumerate(model_layers)]
-    return model_layers
-
-def setup_ddp_pipe(rank, world_size):
-    # Initialize process group and wrap model in DDP.
-    os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '29500'
-    dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
-
-# Need to use 'checkpoint=never' since as of PyTorch 1.8, Pipe checkpointing
-# doesn't work with DDP.
-from torch.distributed.pipeline.sync import Pipe
-
-# Pipeline Training
-def train_ddp_pipe(rank, world_size, args):
-    def print_with_rank(msg):
-        print('[RANK {}]: {}'.format(rank, msg))
-
-    device = torch.device(2 * rank)
-    variant = 'B' if args.emb_dim == 768 else 'L'
-    exp_name = f"ViT_{args.setting}_ep{args.epochs}_LR{args.lr}_BS{args.batch_size}_{args.patch_size}P_{variant}/emb{args.emb_dim}"
-    wandb_config = dict(
-        epochs=args.epochs,
-        learning_rate=args.lr,
-        batch_size=args.batch_size,
-        )
-    
-    # Get dataset
-    train_transforms = transforms.Compose([
-        transforms.Resize(224),
-        transforms.RandomHorizontalFlip(),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-    ])
-    val_transforms = transforms.Compose([
-        transforms.Resize(224),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
-    ])
-    train_dataset = TinyImageNetDataset(root_dir='./data', transform=train_transforms)
-    val_dataset = TinyImageNetDataset(root_dir='./data', mode='val', transform=val_transforms)
-
-    train_loader = DataLoader(train_dataset, batch_size=int(args.batch_size / args.world_size), shuffle=False, 
-                              num_workers=4, sampler=DistributedSampler(train_dataset))
-    val_loader = DataLoader(val_dataset, batch_size=args.batch_size//2, shuffle=False, num_workers=4)
-
-    ## DDP Pipeline 
-    tmpfile = tempfile.NamedTemporaryFile()
-    rpc.init_rpc(
-        name="worker",
-        rank=0,
-        world_size=1,
-        rpc_backend_options=rpc.TensorPipeRpcBackendOptions(
-            init_method="file://{}".format(tmpfile.name)
-        )
-    )
-    num_gpus = args.world_size
-    model_layers = model_ddp_pipe_rank(args, rank)
-    chunks = 8
-    model = Pipe(torch.nn.Sequential(*model_layers), chunks=chunks, checkpoint="never")
-
-    setup_ddp_pipe(rank, world_size)
-    model = DDP(model)
-
-    def get_total_params(module: torch.nn.Module):
-        total_params = 0
-        for param in module.parameters():
-            total_params += param.numel()
-        return total_params
-
-    print_with_rank('Total parameters in model: {:,}'.format(get_total_params(model)))
-
-    # Train the model
-    num_epochs = args.epochs
-    # Set the loss function and optimizer
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    for epoch in range(num_epochs):
-        start_time = time()
-        model.train()
-        running_loss = 0.0
-        correct = 0
-        total = 0
-        for i, (images, labels) in tqdm(enumerate(train_loader), total=len(train_loader)):
-            images, labels = images.to(f"cuda:{0 + device}"), labels.to(f"cuda:{1 + device}")   # Pipeline is split across 2 GPUS strictly
-            optimizer.zero_grad()
-
-            outputs = model(images).local_value()
-            loss = criterion(outputs, labels)
-            loss.backward()
-            optimizer.step()
-
-            _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum()
-
-            running_loss += loss.item()
-
-        train_accuracy = 100 * correct / total
-        epoch_time = time() - start_time
-
-        # # Validate every 3 epochs
-        # if (epoch + 1) % 3 == 0:
-        #     torch.cuda.empty_cache()
-        #     val_acc, val_loss = validate(val_loader, model, device)
-        #     # wandb.log({"epoch": epoch, "loss": running_loss / len(train_loader), "train_acc": train_accuracy, "val_acc": val_acc, "val_loss": val_loss})
-        #     print(f"Epoch [{epoch}/{num_epochs-1}] {epoch_time:.2f}secs, Loss: {running_loss / len(train_loader):.4f}, Train Acc: {train_accuracy:.4f}, Val Acc: {val_acc:.4f}, Val Loss: {val_loss:.4f}")
-        # else:
-        # wandb.log({"epoch": epoch, "epoch_time": epoch_time, "loss": running_loss / len(train_loader), "train_acc": train_accuracy})
-        print(f"Epoch [{epoch}/{num_epochs-1}] {epoch_time:.2f}secs, Loss: {running_loss / len(train_loader):.4f}, Train Acc: {train_accuracy:.4f}\n")
-
 
 if __name__ == "__main__":
     #parse command line arguments
     parser = argparse.ArgumentParser("ViT training script")
     parser.add_argument("--epochs", type=int, default=5, help="number of epochs")
     parser.add_argument("--lr", type=float, default=0.00005, help="learning rate")
-    parser.add_argument("--batch_size", type=int, default=64, help="batch size")
+    parser.add_argument("--batch_size", type=int, default=16, help="batch size")
     parser.add_argument("--num_workers", type=int, default=4, help="number of workers")
-    parser.add_argument("--depth", type=int, default=12, help="depth of transformer")
+    parser.add_argument("--depth", type=int, default=6, help="depth of transformer")
     parser.add_argument("--patch_size", type=int, default=16, help="patch size")
-    parser.add_argument("--emb_dim", type=int, default=768, help="embedding dimension")
-    parser.add_argument("--setting", type=str, default="baseline", help="Training setting")
+    parser.add_argument("--emb_dim", type=int, default=512, help="embedding dimension")
+    parser.add_argument("--setting", type=str, default="gpipe", help="Training setting")
     parser.add_argument("--world_size", type=int, default=1, help="Number of GPUs to use")
     args = parser.parse_args()
     
@@ -459,26 +281,27 @@ if __name__ == "__main__":
         mp.spawn(ddp_train, args=(args.world_size, args), nprocs=args.world_size, join=True)
     
     ## Pipeline training
-    elif args.setting == "pipeline":
-        tmpfile = tempfile.NamedTemporaryFile()
-        rpc.init_rpc(
-            name="worker",
-            rank=0,
-            world_size=1,
-            rpc_backend_options=rpc.TensorPipeRpcBackendOptions(
-                init_method="file://{}".format(tmpfile.name)
+    elif args.setting == "gpipe":
+        print("Running GPipe training")
+        
+        model = GPipeViT(
+            image_size = 224,
+            patch_size = args.patch_size,
+            num_classes = 200,
+            dim = args.emb_dim,
+            depth = args.depth,
+            heads = 16,
+            mlp_dim = 2048,
+            dropout = 0.1,
+            emb_dropout = 0.1
             )
-        )
+        
+        device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-        num_gpus = 2 #args.world_size
-        partition_len = ((6 - 1) // num_gpus) + 1
+        # per_gpu = (args.depth + 2) // args.world_size
+        # initial_gpu = per_gpu + (len(model) - per_gpu * args.world_size)
+        model = GPipe(model, balance=[2, 2, 2, 2], chunks=8)
+        model = train(train_loader, model, epoch_number=args.epochs, learning_rate=args.lr, device=device)
 
-        model_layers = model_pipe_rank(args)
-        chunks = 8
-        model = Pipe(torch.nn.Sequential(*model_layers), chunks=chunks)
 
-        with wandb.init(project="ML710", entity="jameelhassan", name=exp_name, config=wandb_config):
-            train_pipe(train_loader, model, epoch_number=args.epochs, learning_rate=args.lr)
-
-    elif args.setting == "ddp_pipeline":
-        mp.spawn(train_ddp_pipe, args=(args.world_size, args), nprocs=args.world_size, join=True)
+        
