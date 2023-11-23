@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sanoojan-example-pod-1
+spec:
+  restartPolicy: Never
+  containers:
+    - name: cuda-container
+      image: '192.168.62.116:5000/pytorch/pytorch:1.7.0-cuda11.0-cudnn8-devel'
+      command: [""]
+      volumeMounts:
+      - name: conda-env
+        mountPath: /conda-env  # Specify the desired mount path inside the container
+        readOnly: true
+      resources:
+        limits:
+          nvidia.com/gpu: 1
+  volumes:
+  - name: conda-env
+    hostPath:
+      path: /home/sanoojan.baliah/.conda/envs/dist_vit/bin

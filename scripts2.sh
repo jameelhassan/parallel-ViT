@@ -1,2 +1,1 @@
-CUDA_VISIBLE_DEVICES=2 python train.py --epochs 100 --lr 0.00001 --batch_size 256
-CUDA_VISIBLE_DEVICES=2 python train.py --epochs 100 --lr 0.00001 --batch_size 256 --patch_size 32 
+CUDA_VISIBLE_DEVICES=1,3 python train_fsdp_quntization.py --epochs 35 --lr 0.0002 --batch_size 200 --setting "fsdp" --world_size 2

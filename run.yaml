@@ -1,0 +1,23 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: sanoojan-run-pod2
+spec:
+  restartPolicy: Never
+  containers:
+    - name: cuda-container
+      image: 'cool_sanoo_image:v1'
+      command: ["sh", "/k8s_data/script0.sh"]
+      # env:
+      # - name: PATH
+      #   value: "/opt/conda/bin:/home/sanoojan.baliah/.conda/envs/dist_vit/bin"
+      resources:
+        limits:
+          nvidia.com/gpu: 2
+      volumeMounts:
+        - mountPath: /k8s_data
+          name: volume
+  volumes:
+    - name: volume
+      hostPath:
+        path: /home/sanoojan.baliah/project/parallel-ViT
