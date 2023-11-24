@@ -135,7 +135,7 @@ def ddp_train(rank, world_size, args):
         )
     
     if rank == 0:
-        wandb.init(project="ViT_quantization", name=exp_name, config=wandb_config)
+        wandb.init(project="VIT_Distributed", name="VIT_DDP_quantization_powerSGD", config=args)
     
     # create model and move it to GPU with id rank
     model = ViT(
@@ -153,15 +153,15 @@ def ddp_train(rank, world_size, args):
     train_ds, val_ds = get_datasets()
     train_loader = DataLoader(train_ds, batch_size=int(args.batch_size / args.world_size), shuffle=False, 
                               num_workers=4, sampler=DistributedSampler(train_ds))
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size//2, shuffle=False, num_workers=4)
+    # val_loader = DataLoader(val_ds, batch_size=args.batch_size//2, shuffle=False, num_workers=4)
 
     model = model.to(rank)
     model = DDP(model, device_ids=[rank])
-    
+    print("power sgd starts:1000")
     state = powerSGD.PowerSGDState(
         process_group=None, 
         matrix_approximation_rank=1,
-        start_powerSGD_iter=10,
+        start_powerSGD_iter=1000,
     )
     model.register_comm_hook(state, powerSGD.powerSGD_hook)
     num_epochs = args.epochs
@@ -169,6 +169,7 @@ def ddp_train(rank, world_size, args):
     # Set the loss function and optimizer
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
+    iters = 0
     for epoch in range(num_epochs):
         # Display progress bar only for rank 0
         if rank == 0:
@@ -197,19 +198,20 @@ def ddp_train(rank, world_size, args):
             running_loss += loss.item()
             if rank == 0:
                 progress_bar.update(1)
-
+                wandb.log({"iter": iters, "loss": loss.item()})
+                iters += 1   
         train_accuracy = 100 * correct / total
         epoch_time = time() - start_time
 
         if rank == 0:
-            if (epoch + 1) % 1 == 0:
-                torch.cuda.empty_cache()
-                val_acc, val_loss = validate(val_loader, model, f'cuda:{str(rank)}')
-                wandb.log({"epoch": epoch, "loss": running_loss / len(train_loader), "train_acc": train_accuracy, "val_acc": val_acc, "val_loss": val_loss})
-                print(f"Epoch [{epoch}/{num_epochs-1}] {epoch_time}s, Loss: {running_loss / len(train_loader):.4f}, Train Acc: {train_accuracy:.4f}, Val Acc: {val_acc:.4f}, Val Loss: {val_loss:.4f}")
-            else:
-                wandb.log({"epoch": epoch, "epoch_time": epoch_time, "loss": running_loss / len(train_loader), "train_acc": train_accuracy})
-                print(f"Epoch [{epoch}/{num_epochs-1}] {epoch_time}s, Loss: {running_loss / len(train_loader):.4f}, Train Acc: {train_accuracy:.4f}\n")
+            # if (epoch + 1) % 1 == 0:
+            #     torch.cuda.empty_cache()
+            #     val_acc, val_loss = validate(val_loader, model, f'cuda:{str(rank)}')
+            #     wandb.log({"epoch": epoch, "loss": running_loss / len(train_loader), "train_acc": train_accuracy, "val_acc": val_acc, "val_loss": val_loss})
+            #     print(f"Epoch [{epoch}/{num_epochs-1}] {epoch_time}s, Loss: {running_loss / len(train_loader):.4f}, Train Acc: {train_accuracy:.4f}, Val Acc: {val_acc:.4f}, Val Loss: {val_loss:.4f}")
+            # else:
+            wandb.log({"epoch": epoch, "epoch_time": epoch_time, "loss": running_loss / len(train_loader), "train_acc": train_accuracy})
+            print(f"Epoch [{epoch}/{num_epochs-1}] {epoch_time}s, Loss: {running_loss / len(train_loader):.4f}, Train Acc: {train_accuracy:.4f}\n")
 
     cleanup()
 

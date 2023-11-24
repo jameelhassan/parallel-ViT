@@ -21,16 +21,8 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
-from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
-from torch.distributed.fsdp.fully_sharded_data_parallel import (
-    CPUOffload,
-    BackwardPrefetch,
-)
-from torch.distributed.fsdp.wrap import (
-    size_based_auto_wrap_policy,
-    enable_wrap,
-    wrap,
-)
+import torch.distributed.algorithms.ddp_comm_hooks.powerSGD_hook as powerSGD
+
 
 # set cuda visible devices 0,2
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0,2"
@@ -38,7 +30,7 @@ from torch.distributed.fsdp.wrap import (
 # breakpoint()
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12357'
+    os.environ['MASTER_PORT'] = '12359'
 
     # initialize the process group
     # dist.init_process_group("gloo", rank=rank, world_size=world_size)
@@ -91,11 +83,11 @@ def train(train_loader, model, epoch_number, learning_rate, device):
         
     return model
 
-def validate(val_loader, model,rank, device):
+def validate(val_loader, model, device):
     # Test the model
     criterion = nn.CrossEntropyLoss()
     model.eval()  # eval mode (batchnorm uses moving mean/variance instead of mini-batch mean/variance)
-    ddp_loss = torch.zeros(3).to(rank)
+    
     with torch.no_grad():
         correct = 0
         total = 0
@@ -104,17 +96,13 @@ def validate(val_loader, model,rank, device):
             images, labels = images.to(device), labels.to(device)
             outputs = model(images)
             val_loss = criterion(outputs, labels).item()
-            ddp_loss[0]+=val_loss
+        
             _, predicted = torch.max(outputs.data, 1)
             total += labels.size(0)
             correct += (predicted == labels).sum()
-            ddp_loss[1]+=correct
-            ddp_loss[2]+=len(labels)
         val_acc = 100 * correct / total
         val_loss = val_loss / len(val_loader)
-    dist.all_reduce(ddp_loss, op=dist.ReduceOp.SUM)
-    return val_acc, val_loss,ddp_loss
-
+    return val_acc, val_loss
 def get_datasets():
     # Get dataset
     train_transforms = transforms.Compose([
@@ -147,7 +135,7 @@ def ddp_train(rank, world_size, args):
         )
     
     if rank == 0:
-        wandb.init(project="VIT_Test", name=exp_name, config=wandb_config)
+        wandb.init(project="VIT_Distributed", name="VIT_DDP_quantization_powerSGD", config=args)
     
     # create model and move it to GPU with id rank
     model = ViT(
@@ -169,13 +157,19 @@ def ddp_train(rank, world_size, args):
 
     model = model.to(rank)
     model = DDP(model, device_ids=[rank])
-
+    print("power sgd starts:1000")
+    state = powerSGD.PowerSGDState(
+        process_group=None, 
+        matrix_approximation_rank=1,
+        start_powerSGD_iter=1000,
+    )
+    model.register_comm_hook(state, powerSGD.powerSGD_hook)
     num_epochs = args.epochs
 
     # Set the loss function and optimizer
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
-    iters=0
+    iters = 0
     for epoch in range(num_epochs):
         # Display progress bar only for rank 0
         if rank == 0:
@@ -205,10 +199,10 @@ def ddp_train(rank, world_size, args):
             if rank == 0:
                 progress_bar.update(1)
                 wandb.log({"iter": iters, "loss": loss.item()})
-            iters+=1
+            iters += 1   
         train_accuracy = 100 * correct / total
         epoch_time = time() - start_time
-        
+
         if rank == 0:
             # if (epoch + 1) % 1 == 0:
             #     torch.cuda.empty_cache()
@@ -217,7 +211,7 @@ def ddp_train(rank, world_size, args):
             #     print(f"Epoch [{epoch}/{num_epochs-1}] {epoch_time}s, Loss: {running_loss / len(train_loader):.4f}, Train Acc: {train_accuracy:.4f}, Val Acc: {val_acc:.4f}, Val Loss: {val_loss:.4f}")
             # else:
             wandb.log({"epoch": epoch, "epoch_time": epoch_time, "loss": running_loss / len(train_loader), "train_acc": train_accuracy})
-            print(f"Epoch [{epoch}/{num_epochs-1}] {epoch_time}s, epoch_loss: {running_loss / len(train_loader):.4f}, Train Acc: {train_accuracy:.4f}\n")
+            print(f"Epoch [{epoch}/{num_epochs-1}] {epoch_time}s, Loss: {running_loss / len(train_loader):.4f}, Train Acc: {train_accuracy:.4f}\n")
 
     cleanup()
 
@@ -229,10 +223,10 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=50, help="number of epochs")
     parser.add_argument("--lr", type=float, default=0.0002, help="learning rate")
     parser.add_argument("--batch_size", type=int, default=256, help="batch size")
-    parser.add_argument("--num_workers", type=int, default=4, help="number of workers")
+    parser.add_argument("--num_workers", type=int, default=0, help="number of workers")
     parser.add_argument("--patch_size", type=int, default=16, help="patch size")
     parser.add_argument("--emb_dim", type=int, default=768, help="embedding dimension")
-    parser.add_argument("--setting", type=str, default="fsdp", help="Training setting")
+    parser.add_argument("--setting", type=str, default="ddp", help="Training setting")
     parser.add_argument("--world_size", type=int, default=2, help="Number of GPUs to use")
     args = parser.parse_args()
     

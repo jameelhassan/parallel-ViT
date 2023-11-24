@@ -1,13 +1,13 @@
 apiVersion: v1
 kind: Pod
 metadata:
-  name: sanoojan-run-pod2
+  name: sanoojan-run-pod1
 spec:
   restartPolicy: Never
   containers:
     - name: cuda-container
-      image: 'cool_sanoo_image:v1'
-      command: ["sh", "/k8s_data/script0.sh"]
+      image: '192.168.62.116:5000/jh-vit'
+      command: ["sh", "/k8s_data/scripts0.sh"]
       # env:
       # - name: PATH
       #   value: "/opt/conda/bin:/home/sanoojan.baliah/.conda/envs/dist_vit/bin"
