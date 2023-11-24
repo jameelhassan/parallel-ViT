@@ -22,7 +22,10 @@ import torch.multiprocessing as mp
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed.algorithms.ddp_comm_hooks.powerSGD_hook as powerSGD
-
+from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import bf16_compress_hook
+from torch.distributed.algorithms.ddp_comm_hooks.quantization_hooks import quantization_pertensor_hook
+from torch.distributed.algorithms.ddp_comm_hooks.quantization_hooks import quantization_perchannel_hook
+from torch.distributed.algorithms.ddp_comm_hooks.default_hooks import fp16_compress_hook
 
 # set cuda visible devices 0,2
 # os.environ["CUDA_VISIBLE_DEVICES"] = "0,2"
@@ -158,12 +161,15 @@ def ddp_train(rank, world_size, args):
     model = model.to(rank)
     model = DDP(model, device_ids=[rank])
     print("power sgd starts:1000")
-    state = powerSGD.PowerSGDState(
-        process_group=None, 
-        matrix_approximation_rank=1,
-        start_powerSGD_iter=1000,
-    )
-    model.register_comm_hook(state, powerSGD.powerSGD_hook)
+    # state = powerSGD.PowerSGDState(
+    #     process_group=None, 
+    #     matrix_approximation_rank=1,
+    #     start_powerSGD_iter=1000,
+    # )
+    # model.register_comm_hook(state, powerSGD.powerSGD_hook)
+    
+    process_group = dist.new_group([i for i in range(world_size)])
+    model.register_comm_hook(process_group, fp16_compress_hook)
     num_epochs = args.epochs
 
     # Set the loss function and optimizer
