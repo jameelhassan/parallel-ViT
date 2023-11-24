@@ -32,9 +32,10 @@ from pipe_vit import PipeViT
 from pipe_vit import GPipeViT
 from torchgpipe import GPipe
 
+
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12352'
+    os.environ['MASTER_PORT'] = '12359'
 
     # initialize the process group
     dist.init_process_group("nccl", rank=rank, world_size=world_size)
@@ -71,7 +72,7 @@ def train(train_loader, model, epoch_number, learning_rate, device):
             correct += (predicted == labels).sum()
 
             running_loss += loss.item()
-            # wandb.log({"loss": loss, "iter": iters})
+            wandb.log({"loss": loss, "iter": iters})
             iters += 1
 
         train_accuracy = 100 * correct / total
@@ -113,8 +114,8 @@ def get_datasets():
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])
-    train_dataset = TinyImageNetDataset(root_dir='./data', transform=train_transforms)
-    val_dataset = TinyImageNetDataset(root_dir='./data', mode='val', transform=val_transforms)
+    train_dataset = TinyImageNetDataset(root_dir='/app/data', transform=train_transforms)
+    val_dataset = TinyImageNetDataset(root_dir='/app/data', mode='val', transform=val_transforms)
     
     return train_dataset, val_dataset
 
@@ -290,7 +291,7 @@ def model_ddp_pipe_rank(args, rank):
 def setup_ddp_pipe(rank, world_size):
     # Initialize process group and wrap model in DDP.
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '29501'
+    os.environ['MASTER_PORT'] = '29500'
     dist.init_process_group(backend="nccl", rank=rank, world_size=world_size)
 
 # Need to use 'checkpoint=never' since as of PyTorch 1.8, Pipe checkpointing
@@ -324,7 +325,7 @@ def train_ddp_pipe(rank, world_size, args):
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])
-    train_dataset = TinyImageNetDataset(root_dir='./data', transform=train_transforms)
+    train_dataset = TinyImageNetDataset(root_dir='/app/data', transform=train_transforms)
     train_sampler = DistributedSampler(train_dataset, num_replicas=num_gpus, rank=rank)
     train_loader = DataLoader(train_dataset, batch_size=int(args.batch_size / num_gpus), shuffle=False, 
                               num_workers=args.num_workers, sampler=train_sampler)
@@ -411,6 +412,7 @@ def choose_pipe_split(split_id):
 
     return balance
 
+
 if __name__ == "__main__":
     #parse command line arguments
     parser = argparse.ArgumentParser("ViT training script")
@@ -422,7 +424,7 @@ if __name__ == "__main__":
     parser.add_argument("--patch_size", type=int, default=16, help="patch size")
     parser.add_argument("--emb_dim", type=int, default=768, help="embedding dimension")
     parser.add_argument("--setting", type=str, default="baseline", help="Training setting")
-    parser.add_argument("--world_size", type=int, default=2, help="Number of GPUs to use")
+    parser.add_argument("--world_size", type=int, default=1, help="Number of GPUs to use")
     parser.add_argument("--pipe_split", type=int, default=1, help="Version of splits for pipeline")
     parser.add_argument("--pipe_chunks", type=int, default=8, help="Number of chunks for pipeline")
     args = parser.parse_args()
@@ -449,8 +451,8 @@ if __name__ == "__main__":
         transforms.ToTensor(),
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])
     ])
-    train_dataset = TinyImageNetDataset(root_dir='./data', transform=train_transforms)
-    val_dataset = TinyImageNetDataset(root_dir='./data', mode='val', transform=val_transforms)
+    train_dataset = TinyImageNetDataset(root_dir='/app/data', transform=train_transforms)
+    val_dataset = TinyImageNetDataset(root_dir='/app/data', mode='val', transform=val_transforms)
 
     train_loader = DataLoader(train_dataset, batch_size=args.batch_size, shuffle=True, num_workers=args.num_workers)
     val_loader = DataLoader(val_dataset, batch_size=args.batch_size//2, shuffle=False, num_workers=args.num_workers)
@@ -508,7 +510,8 @@ if __name__ == "__main__":
 
     elif args.setting == "ddp_pipeline":
         mp.spawn(train_ddp_pipe, args=(args.world_size, args), nprocs=args.world_size, join=True)
-
+    
+    ## Pipeline training
     elif args.setting == "gpipe":
         model = GPipeViT(
             image_size = 224,

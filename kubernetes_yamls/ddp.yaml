@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: jh-ddp
+spec:
+  restartPolicy: Never
+  containers:
+    - name: cuda-container
+      image: '192.168.62.116:5000/jh-vit-pytorch1.12'
+      command: ["python", "/app/docker_train.py"]
+      args: ["--setting", "ddp", "--world_size", "2", "--batch_size", "320"]
+      resources:
+        limits:
+          nvidia.com/gpu: 2
+      volumeMounts:
+        - mountPath: /app
+          name: volume
+        - mountPath: /app/data
+          name: data
+  volumes:
+    - name: volume
+      hostPath:
+        path: /home/jameel.hassan/ML701/parallel-ViT
+    - name: data
+      hostPath:
+        path: /home/jameel.hassan/ML701/datasets/tiny-imagenet-200/

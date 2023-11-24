@@ -34,10 +34,10 @@ from torchgpipe import GPipe
 
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12359'
+    os.environ['MASTER_PORT'] = '12351'
 
     # initialize the process group
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    dist.init_process_group("nccl", rank=rank, world_size=world_size)
 
 def cleanup():
     dist.destroy_process_group()
@@ -49,6 +49,7 @@ def train(train_loader, model, epoch_number, learning_rate, device):
     # Set the loss function and optimizer
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
+    iters = 0
     for epoch in range(num_epochs):
         start_time = time()
         model.train()
@@ -70,19 +71,13 @@ def train(train_loader, model, epoch_number, learning_rate, device):
             correct += (predicted == labels).sum()
 
             running_loss += loss.item()
+            wandb.log({"loss": loss, "iter": iters})
+            iters += 1 
 
         train_accuracy = 100 * correct / total
         epoch_time = time() - start_time
 
-        # Validate every 3 epochs
-        if (epoch + 1) % 3 == 0:
-            torch.cuda.empty_cache()
-            val_acc, val_loss = validate(val_loader, model, device)
-            wandb.log({"epoch": epoch, "loss": running_loss / len(train_loader), "train_acc": train_accuracy, "val_acc": val_acc, "val_loss": val_loss})
-            print(f"Epoch [{epoch}/{num_epochs-1}] {epoch_time:.2f}secs, Loss: {running_loss / len(train_loader):.4f}, Train Acc: {train_accuracy:.4f}, Val Acc: {val_acc:.4f}, Val Loss: {val_loss:.4f}")
-        else:
-            wandb.log({"epoch": epoch, "epoch_time": epoch_time, "loss": running_loss / len(train_loader), "train_acc": train_accuracy})
-            print(f"Epoch [{epoch}/{num_epochs-1}] {epoch_time:.2f}secs, Loss: {running_loss / len(train_loader):.4f}")
+        print(f"Epoch [{epoch}/{num_epochs-1}] {epoch_time:.2f}secs, Loss: {running_loss / len(train_loader):.4f}")
         
     return model
 
@@ -155,7 +150,7 @@ def ddp_train(rank, world_size, args):
     train_ds, val_ds = get_datasets()
     train_loader = DataLoader(train_ds, batch_size=int(args.batch_size / args.world_size), shuffle=False, 
                               num_workers=4, sampler=DistributedSampler(train_ds))
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size//2, shuffle=False, num_workers=4)
+    # val_loader = DataLoader(val_ds, batch_size=args.batch_size//2, shuffle=False, num_workers=4)
 
     model = model.to(rank)
     ddp_model = DDP(model, device_ids=[rank])
@@ -165,6 +160,7 @@ def ddp_train(rank, world_size, args):
     # Set the loss function and optimizer
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(ddp_model.parameters(), lr=args.lr)
+    iters = 0
     for epoch in range(num_epochs):
         # Display progress bar only for rank 0
         if rank == 0:
@@ -193,35 +189,44 @@ def ddp_train(rank, world_size, args):
             running_loss += loss.item()
             if rank == 0:
                 progress_bar.update(1)
+                wandb.log({"loss": loss, "iter": iters})
+                iters += 1 
 
         train_accuracy = 100 * correct / total
         epoch_time = time() - start_time
 
         if rank == 0:
-            if (epoch + 1) % 1 == 0:
-                torch.cuda.empty_cache()
-                val_acc, val_loss = validate(val_loader, model, f'cuda:{str(rank)}')
-                wandb.log({"epoch": epoch, "loss": running_loss / len(train_loader), "train_acc": train_accuracy, "val_acc": val_acc, "val_loss": val_loss})
-                print(f"Epoch [{epoch}/{num_epochs-1}] {epoch_time}s, Loss: {running_loss / len(train_loader):.4f}, Train Acc: {train_accuracy:.4f}, Val Acc: {val_acc:.4f}, Val Loss: {val_loss:.4f}")
-            else:
-                wandb.log({"epoch": epoch, "epoch_time": epoch_time, "loss": running_loss / len(train_loader), "train_acc": train_accuracy})
-                print(f"Epoch [{epoch}/{num_epochs-1}] {epoch_time}s, Loss: {running_loss / len(train_loader):.4f}, Train Acc: {train_accuracy:.4f}\n")
+            print(f"Epoch [{epoch}/{num_epochs-1}] {epoch_time}s, Loss: {running_loss / len(train_loader):.4f}, Train Acc: {train_accuracy:.4f}\n")
 
     cleanup()
 
+def choose_pipe_split(split_id):
+    '''
+    Hardcoded splits for GPipe
+    '''
+    if split_id == 1:
+        balance = [4, 3, 3, 4]
+    elif split_id == 2:
+        balance = [5, 3, 3, 3]
+    elif split_id == 3:
+        balance = [3, 3, 4, 4]
+
+    return balance
 
 if __name__ == "__main__":
     #parse command line arguments
     parser = argparse.ArgumentParser("ViT training script")
-    parser.add_argument("--epochs", type=int, default=5, help="number of epochs")
-    parser.add_argument("--lr", type=float, default=0.00005, help="learning rate")
-    parser.add_argument("--batch_size", type=int, default=16, help="batch size")
+    parser.add_argument("--epochs", type=int, default=35, help="number of epochs")
+    parser.add_argument("--lr", type=float, default=2e-4, help="learning rate")
+    parser.add_argument("--batch_size", type=int, default=320, help="batch size")
     parser.add_argument("--num_workers", type=int, default=4, help="number of workers")
-    parser.add_argument("--depth", type=int, default=6, help="depth of transformer")
+    parser.add_argument("--depth", type=int, default=12, help="depth of transformer")
     parser.add_argument("--patch_size", type=int, default=16, help="patch size")
-    parser.add_argument("--emb_dim", type=int, default=512, help="embedding dimension")
+    parser.add_argument("--emb_dim", type=int, default=768, help="embedding dimension")
     parser.add_argument("--setting", type=str, default="gpipe", help="Training setting")
     parser.add_argument("--world_size", type=int, default=1, help="Number of GPUs to use")
+    parser.add_argument("--pipe_split", type=int, default=1, help="Version of splits for pipeline")
+    parser.add_argument("--pipe_chunks", type=int, default=8, help="Number of chunks for pipeline")
     args = parser.parse_args()
     
     ## Data and wandb inits
@@ -282,8 +287,7 @@ if __name__ == "__main__":
     
     ## Pipeline training
     elif args.setting == "gpipe":
-        print("Running GPipe training")
-        
+         
         model = GPipeViT(
             image_size = 224,
             patch_size = args.patch_size,
@@ -298,10 +302,11 @@ if __name__ == "__main__":
         
         device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
-        # per_gpu = (args.depth + 2) // args.world_size
-        # initial_gpu = per_gpu + (len(model) - per_gpu * args.world_size)
-        model = GPipe(model, balance=[2, 2, 2, 2], chunks=8)
-        model = train(train_loader, model, epoch_number=args.epochs, learning_rate=args.lr, device=device)
+        balance = choose_pipe_split(args.pipe_split)
+        wandb_config["pipe_split"] = balance
+        wandb_config["pipe_chunks"] = args.pipe_chunks
+        exp_name = exp_name + f"_split{args.pipe_split}_chunks{args.pipe_chunks}"
 
-
-        
+        model = GPipe(model, balance=balance, chunks=args.pipe_chunks)
+        with wandb.init(project="ML710", entity="jameelhassan", name=exp_name, config=wandb_config):
+            model = train(train_loader, model, epoch_number=args.epochs, learning_rate=args.lr, device=device)
