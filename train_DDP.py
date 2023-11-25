@@ -138,7 +138,7 @@ def ddp_train(rank, world_size, args):
         )
     
     if rank == 0:
-        wandb.init(project="VIT_Distributed", name="VIT_FP16", config=args)
+        wandb.init(project="VIT_Distributed", name="VIT_DDP", config=args)
     
     # create model and move it to GPU with id rank
     model = ViT(
@@ -168,8 +168,8 @@ def ddp_train(rank, world_size, args):
     # )
     # model.register_comm_hook(state, powerSGD.powerSGD_hook)
     
-    process_group = dist.new_group([i for i in range(world_size)])
-    model.register_comm_hook(process_group, fp16_compress_hook)
+    # process_group = dist.new_group([i for i in range(world_size)])
+    # model.register_comm_hook(process_group, fp16_compress_hook)
     num_epochs = args.epochs
 
     # Set the loss function and optimizer
